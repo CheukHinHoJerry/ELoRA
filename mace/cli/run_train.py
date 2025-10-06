@@ -14,6 +14,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
+import torch
+torch.serialization.add_safe_globals([slice])
+
 import numpy as np
 import torch.distributed
 import torch.nn.functional
@@ -42,6 +45,62 @@ from mace.tools.scripts_utils import (
 from mace.tools.slurm_distributed import DistributedEnvironment
 from mace.tools.utils import AtomicNumberTable
 
+import loralib as lora
+
+
+
+def extract_dense_weight(o3_linear):
+    """Convert e3nn.o3.Linear into a dense (out_features × in_features) weight matrix,
+    preserving the layer's dtype and device."""
+    in_features = o3_linear.irreps_in.dim
+    out_features = o3_linear.irreps_out.dim
+
+    # Detect dtype and device from layer
+    param = next(o3_linear.parameters(), None)
+    dtype = param.dtype if param is not None else torch.get_default_dtype()
+    device = param.device if param is not None else torch.device("cpu")
+
+    W = []
+    with torch.no_grad():
+        for i in range(in_features):
+            x = torch.zeros(1, in_features, dtype=dtype, device=device)
+            x[0, i] = 1.0
+            y = o3_linear(x)
+            W.append(y[0].to(device=device, dtype=dtype))
+        W = torch.stack(W, dim=1)
+    return W
+
+
+def replace_o3_linear_with_lora(module, rank=16, verbose=True):
+    """
+    Recursively replace all e3nn.o3.Linear layers in a module with lora.Linear.
+    Keeps the same dtype/device as the original layer.
+    """
+    for name, child in list(module.named_children()):
+        # Recurse into submodules first
+        replace_o3_linear_with_lora(child, rank=rank, verbose=verbose)
+
+        if isinstance(child, o3.Linear):
+            in_features = child.irreps_in.dim
+            out_features = child.irreps_out.dim
+
+            # Detect device/dtype from the child
+            param = next(child.parameters(), None)
+            dtype = param.dtype if param is not None else torch.get_default_dtype()
+            device = param.device if param is not None else torch.device("cpu")
+
+            # Create equivalent LoRA Linear on the same device/dtype
+            new_layer = lora.Linear(in_features, out_features, bias=False, r=rank).to(device=device, dtype=dtype)
+
+            # Copy dense weight
+            with torch.no_grad():
+                W = extract_dense_weight(child)
+                new_layer.weight.copy_(W)
+
+            setattr(module, name, new_layer)
+
+            if verbose:
+                print(f"[Replaced] {name}: o3.Linear({in_features}->{out_features}) → LoRA(r={rank}) [{device}, {dtype}]")
 
 def main() -> None:
     """
@@ -112,7 +171,7 @@ def run(args: argparse.Namespace) -> None:
             )
             model_foundation = calc.models[0]
         else:
-            model_foundation = torch.load(args.foundation_model, map_location=device)
+            model_foundation = torch.load(args.foundation_model, map_location=device, weights_only=False)
             logging.info(
                 f"Using foundation model {args.foundation_model} as initial checkpoint."
             )
@@ -701,6 +760,7 @@ def run(args: argparse.Namespace) -> None:
     else:
         distributed_model = None
 
+    replace_o3_linear_with_lora(model, rank = 16, verbose = True)
     tools.train(
         model=model,
         loss_fn=loss_fn,
