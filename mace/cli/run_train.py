@@ -14,6 +14,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
+import torch
+torch.serialization.add_safe_globals([slice])
+
 import numpy as np
 import torch.distributed
 import torch.nn.functional
@@ -112,7 +115,7 @@ def run(args: argparse.Namespace) -> None:
             )
             model_foundation = calc.models[0]
         else:
-            model_foundation = torch.load(args.foundation_model, map_location=device)
+            model_foundation = torch.load(args.foundation_model, map_location=device, weights_only=False)
             logging.info(
                 f"Using foundation model {args.foundation_model} as initial checkpoint."
             )
