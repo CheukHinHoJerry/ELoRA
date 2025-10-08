@@ -18,12 +18,12 @@ class _Layer(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.randn(h_in, h_out))
         # LoRA weights initialization
-        self.LoRA_weight = []
+        # self.LoRA_weight = []
         self.alpha = 16
         self.r = 16
-        self.LoRA_weight.append(torch.nn.Parameter(torch.randn(h_in, self.r)))
-        self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(self.r, h_out)))
-        self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
+        # self.LoRA_weight.append(torch.nn.Parameter(torch.randn(h_in, self.r)))
+        # self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(self.r, h_out)))
+        # self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
         self.act = act
 
         self.h_in = h_in
@@ -32,7 +32,7 @@ class _Layer(torch.nn.Module):
         self.var_out = var_out
 
         self._profiling_str = repr(self)
-
+    
     def __repr__(self):
         act = self.act
         if hasattr(act, '__name__'):
@@ -42,9 +42,39 @@ class _Layer(torch.nn.Module):
 
         return f"Layer({self.h_in}->{self.h_out}, act={act})"
 
+    def compute_deltaW_via_svd(self):
+        # Compute SVD (no grad)
+        with torch.no_grad():
+            W = self.weight.data
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+
+            # Truncate to top-rank components
+            r = min(self.r, S.size(0))
+            U_r = U[:, :r]
+            S_r = S[:r]
+            Vh_r = Vh[:r, :]
+
+        # Keep U and Vh fixed
+        self.register_buffer("U_r", U_r)
+        self.register_buffer("Vh_r", Vh_r)
+
+        # Only S is trainable
+        self.S_r = torch.nn.Parameter(S_r.clone() * 0.0)
+
+    def reconstruct_weight(self):
+        """Reconstruct low-rank weight approximation."""
+        return self.U_r @ torch.diag(self.S_r) @ self.Vh_r
+
     def forward(self, x: torch.Tensor):
         # - PROFILER - with torch.autograd.profiler.record_function(self._profiling_str):
-        weight = self.weight + self.alpha / self.r * self.LoRA_weight[0] @ self.LoRA_weight[1]
+        
+        # init weight from lora
+        if hasattr(self, "U_r"):
+            weight = self.weight + self.reconstruct_weight()
+        else:
+            weight = self.weight
+
+        # forward
         if self.act is not None:
             w = weight / (self.h_in * self.var_in)**0.5
             x = x @ w
@@ -56,8 +86,11 @@ class _Layer(torch.nn.Module):
         return x
     
     def merge_LoRA(self):
-        self.weight.data = self.weight + self.alpha / self.r * self.LoRA_weight[0] @ self.LoRA_weight[1]
-        del self.LoRA_weight
+        self.weight.data = self.weight + self.reconstruct_weight() # + self.alpha / self.r * self.LoRA_weight[0] @ self.LoRA_weight[1]
+        # del self.LoRA_weight
+        del self.S_r
+        del self.U_r
+        del self.Vh_r
         del self.alpha
         del self.r
 
