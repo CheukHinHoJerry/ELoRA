@@ -220,19 +220,22 @@ class Linear(CodeGenMixin, torch.nn.Module):
             "_compiled_main": graphmod
         })
 
+        # save f_in and f_out
+        self.f_in = f_in
+        self.f_out = f_out
         # == Generate weights ==
         if internal_weights and self.weight_numel > 0:
             assert self.shared_weights, "Having internal weights impose shared weights"
             self.weight = torch.nn.Parameter(torch.randn(*((f_in, f_out) if f_in is not None else ()), self.weight_numel))
+            
             # LoRA weights initialization
-            self.LoRA_weight = []
             self.alpha = 16
             self.r = 16
-            for ins in self.instructions:
-                if ins.i_in != -1:
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.randn(*((f_in, f_out) if f_in is not None else ()), ins.path_shape[0], self.r)))
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(*((f_in, f_out) if f_in is not None else ()), self.r, ins.path_shape[1])))
-            self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
+            # for ins in self.instructions:
+            #     if ins.i_in != -1:
+            #         self.LoRA_weight.append(torch.nn.Parameter(torch.randn(*((f_in, f_out) if f_in is not None else ()), ins.path_shape[0], self.r)))
+            #         self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(*((f_in, f_out) if f_in is not None else ()), self.r, ins.path_shape[1])))
+            # self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
             self.LoRA_weight_numel = sum(ins.path_shape[0] * self.r + self.r * ins.path_shape[1] for ins in instructions if ins.i_in != -1)
         else:
             # For TorchScript, there always has to be some kind of defined .weight
@@ -263,6 +266,120 @@ class Linear(CodeGenMixin, torch.nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
 
+    def compute_deltaW_via_svd(self):
+        """Compute SVD per instruction/irrep and store top-rank factors (U,Vh fixed)."""
+        if not hasattr(self, "weight") or self.weight.numel() == 0:
+            return  # no internal weights, skip
+        # Store SVD components per instruction
+        self.U_r_list = []
+        self.Vh_r_list = []
+        self.S_r_list = []
+        self.instruction_offsets = []
+        
+        with torch.no_grad():
+            offset = 0
+            for ins_idx, ins in enumerate(self.instructions):
+                # Skip bias instructions
+                if ins.i_in == -1:
+                    self.U_r_list.append(None)
+                    self.Vh_r_list.append(None)
+                    self.S_r_list.append(None)
+                    continue
+                
+                # Get weight shape for this instruction
+                path_shape = ins.path_shape  # (mul_in, mul_out)
+                weight_size = prod(path_shape)
+                
+                # Extract weights for this instruction
+                W_ins = self.weight.data[..., offset:offset + weight_size]
+                
+                # Reshape to matrix form
+                if len(path_shape) == 2:
+                    mul_in, mul_out = path_shape
+                    W_matrix = W_ins.reshape(mul_in, mul_out)
+                else:
+                    # Handle edge cases
+                    W_matrix = W_ins.reshape(-1, 1) if len(path_shape) == 1 else W_ins
+                
+                # print(f"Instruction {ins_idx}: i_in={ins.i_in}, i_out={ins.i_out}, "
+                #     f"irrep={self.irreps_in[ins.i_in].ir}, shape={path_shape}, "
+                #     f"matrix_shape={W_matrix.shape}")
+                
+                # Perform SVD
+                U, S, Vh = torch.linalg.svd(W_matrix, full_matrices=False)
+                
+                # Determine rank for this instruction
+                r = min(self.r, S.size(0))
+                
+                if r >= self.r:
+                    print("rank", r)
+                    # Store components as buffers/parameters
+                    self.register_buffer(f"U_r_{ins_idx}", U[:, :r])
+                    self.register_buffer(f"Vh_r_{ins_idx}", Vh[:r, :])
+                    setattr(self, f"S_r_{ins_idx}", torch.nn.Parameter(S[:r].clone() * 0.0))
+                    
+                    self.U_r_list.append(U[:, :r])
+                    self.Vh_r_list.append(Vh[:r, :])
+                    self.S_r_list.append(torch.nn.Parameter(S[:r].clone() * 0.0))
+                    self.instruction_offsets.append(offset)
+                else:
+                    print(f"rank {r} < {self.r}, using typical random initi instead")
+                    # randomly full in matrix but make U and Vh trainable
+                    # and of size 
+                    # set U and Vh to be trainble like A and B in the paper
+                    setattr(self, f"U_r_{ins_idx}", torch.nn.Parameter(torch.randn(U[:, :r].shape, device = U.device)))
+                    setattr(self, f"Vh_r_{ins_idx}", torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device = Vh.device)))
+
+                    # not in use
+                    self.register_buffer(f"S_r_{ins_idx}", None)
+
+                    # these are just dummies that are not used in the actual .forward
+                    self.U_r_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape)))
+                    self.Vh_r_list.append(torch.nn.Parameter(torch.randn(Vh[:r, :].shape)))
+                    self.S_r_list.append(None)
+                    
+                offset += weight_size
+                
+        print(f"SVD decomposition complete for {len([x for x in self.U_r_list if x is not None])} instructions")
+
+    def reconstruct_weight(self):
+        """Low-rank reconstruction from frozen U,Vh and trainable S per instruction."""
+        if not hasattr(self, 'U_r_list'):
+            # Fallback: no SVD decomposition has been done
+            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
+        
+        weight_parts = []
+        
+        for ins_idx, ins in enumerate(self.instructions):
+            # Skip bias instructions (i_in == -1)
+            if ins.i_in == -1:
+                continue
+            
+            # Skip if this instruction doesn't have SVD components
+            if self.U_r_list[ins_idx] is None:
+                weight_parts.append(torch.zeros(prod(ins.path_shape), device=self.weight.device, dtype=self.weight.dtype))
+                continue
+            
+            if self.S_r_list[ins_idx] is not None:
+                # Get SVD components for this instruction
+                U_r = getattr(self, f"U_r_{ins_idx}")
+                S_r = getattr(self, f"S_r_{ins_idx}")
+                Vh_r = getattr(self, f"Vh_r_{ins_idx}")
+                # Reconstruct: U @ diag(S) @ Vh
+                W_reconstructed = U_r @ torch.diag(S_r) @ Vh_r
+            else:
+                U_r = getattr(self, f"U_r_{ins_idx}")
+                Vh_r = getattr(self, f"Vh_r_{ins_idx}")
+                W_reconstructed = U_r @ Vh_r
+            # Flatten and add to list
+            weight_parts.append(W_reconstructed.flatten())
+        
+        # Concatenate all weight parts
+        if len(weight_parts) == 0:
+            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
+        
+        return torch.cat(weight_parts)
+
     def forward(self, features, weight: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
         """evaluate
 
@@ -283,13 +400,10 @@ class Linear(CodeGenMixin, torch.nn.Module):
             if self.weight_numel > 0 and not self.internal_weights:
                 raise RuntimeError("Weights must be provided when internal_weights = False")
             weight = self.weight
-            LoRA_weight = []
-            for index, v in enumerate(self.LoRA_weight):
-                if index % 2 == 0:
-                    LoRA_weight.append(v)
-                else:
-                    LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-            weight = weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
+            # Apply low-rank adaptation if SVD decomposition exists
+            if hasattr(self, "U_r_list") and any(x is not None for x in self.U_r_list):
+                delta_weight = self.reconstruct_weight()
+                weight = weight + delta_weight
         if bias is None:
             if self.bias_numel > 0 and not self.internal_weights:
                 raise RuntimeError("Biases must be provided when internal_weights = False")
@@ -359,17 +473,39 @@ class Linear(CodeGenMixin, torch.nn.Module):
                 yield this_weight
 
     def merge_LoRA(self):
-        LoRA_weight = []
-        for index, v in enumerate(self.LoRA_weight):
-            if index % 2 == 0:
-                LoRA_weight.append(v)
-            else:
-                LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-        self.weight.data = self.weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
-        del self.LoRA_weight
-        del self.alpha
-        del self.r
-        del self.LoRA_weight_numel
+        """Merge the low-rank SVD updates back into the main weight."""
+        if not hasattr(self, 'U_r_list'):
+            return  # No SVD decomposition to merge
+        
+        # Add reconstructed delta to original weight
+        self.weight.data = self.weight.data + self.reconstruct_weight()
+        
+        # Clean up all SVD components for each instruction
+        for ins_idx in range(len(self.instructions)):
+            # Delete buffers
+            if hasattr(self, f"U_r_{ins_idx}"):
+                delattr(self, f"U_r_{ins_idx}")
+            if hasattr(self, f"Vh_r_{ins_idx}"):
+                delattr(self, f"Vh_r_{ins_idx}")
+            # Delete parameters
+            if hasattr(self, f"S_r_{ins_idx}"):
+                delattr(self, f"S_r_{ins_idx}")
+        
+        # Clean up the lists and other attributes
+        if hasattr(self, 'U_r_list'):
+            del self.U_r_list
+        if hasattr(self, 'Vh_r_list'):
+            del self.Vh_r_list
+        if hasattr(self, 'S_r_list'):
+            del self.S_r_list
+        if hasattr(self, 'instruction_offsets'):
+            del self.instruction_offsets
+        if hasattr(self, 'alpha'):
+            del self.alpha
+        if hasattr(self, 'r'):
+            del self.r
+        if hasattr(self, 'LoRA_weight_numel'):
+            del self.LoRA_weight_numel
 
 def _codegen_linear(
     irreps_in: o3.Irreps,
