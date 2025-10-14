@@ -270,20 +270,20 @@ class Linear(CodeGenMixin, torch.nn.Module):
         """Compute SVD per instruction/irrep and store top-rank factors (U,Vh fixed)."""
         if not hasattr(self, "weight") or self.weight.numel() == 0:
             return  # no internal weights, skip
+
         # Store SVD components per instruction
-        self.U_r_list = []
-        self.Vh_r_list = []
-        self.S_r_list = []
+        self.LORA_A_list = []
+        self.LORA_B_list = []
         self.instruction_offsets = []
+        self.S_r_list = []
         
         with torch.no_grad():
             offset = 0
             for ins_idx, ins in enumerate(self.instructions):
                 # Skip bias instructions
                 if ins.i_in == -1:
-                    self.U_r_list.append(None)
-                    self.Vh_r_list.append(None)
-                    self.S_r_list.append(None)
+                    self.LORA_A_list = []
+                    self.LORA_B_list = []
                     continue
                 
                 # Get weight shape for this instruction
@@ -314,66 +314,72 @@ class Linear(CodeGenMixin, torch.nn.Module):
                 if r >= self.r:
                     print("rank", r)
                     # Store components as buffers/parameters
-                    self.register_buffer(f"U_r_{ins_idx}", U[:, :r])
-                    self.register_buffer(f"Vh_r_{ins_idx}", Vh[:r, :])
-                    setattr(self, f"S_r_{ins_idx}", torch.nn.Parameter(S[:r].clone() * 0.0))
+                    self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
+                    self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
                     
-                    self.U_r_list.append(U[:, :r])
-                    self.Vh_r_list.append(Vh[:r, :])
-                    self.S_r_list.append(torch.nn.Parameter(S[:r].clone() * 0.0))
-                    self.instruction_offsets.append(offset)
+                    # not in use
+                    self.S_r_list.append(S[r:].clone())
+                    self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
+                    self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
                 else:
                     print(f"rank {r} < {self.r}, using typical random initi instead")
-                    # randomly full in matrix but make U and Vh trainable
-                    # and of size 
+                    # randomly full in matrix but make U and Vh trainable and of size 
                     # set U and Vh to be trainble like A and B in the paper
-                    setattr(self, f"U_r_{ins_idx}", torch.nn.Parameter(torch.randn(U[:, :r].shape, device = U.device)))
-                    setattr(self, f"Vh_r_{ins_idx}", torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device = Vh.device)))
+                    self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device = U.device)))
+                    self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device = Vh.device)))
 
-                    # not in use
+                    # not in use these are just dummies that are not used in the actual .forward
+                    self.S_r_list.append(None)
                     self.register_buffer(f"S_r_{ins_idx}", None)
 
-                    # these are just dummies that are not used in the actual .forward
-                    self.U_r_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape)))
-                    self.Vh_r_list.append(torch.nn.Parameter(torch.randn(Vh[:r, :].shape)))
-                    self.S_r_list.append(None)
-                    
+                self.instruction_offsets.append(offset)
                 offset += weight_size
                 
-        print(f"SVD decomposition complete for {len([x for x in self.U_r_list if x is not None])} instructions")
+        # wrap into parameter 
+        self.LORA_A_list = torch.nn.ParameterList(self.LORA_A_list)
+        self.LORA_B_list = torch.nn.ParameterList(self.LORA_B_list)
+        print(f"SVD decomposition complete for {len([x for x in self.LORA_A_list if x is not None])} instructions")
 
     def reconstruct_weight(self):
         """Low-rank reconstruction from frozen U,Vh and trainable S per instruction."""
-        if not hasattr(self, 'U_r_list'):
+        if not hasattr(self, 'LORA_A_list'):
             # Fallback: no SVD decomposition has been done
             return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
         
         weight_parts = []
-        
+        offset = 0
         for ins_idx, ins in enumerate(self.instructions):
             # Skip bias instructions (i_in == -1)
             if ins.i_in == -1:
                 continue
-            
+
             # Skip if this instruction doesn't have SVD components
-            if self.U_r_list[ins_idx] is None:
-                weight_parts.append(torch.zeros(prod(ins.path_shape), device=self.weight.device, dtype=self.weight.dtype))
-                continue
+            # if self.LORA_A_list[ins_idx] is None:
+            #     ValueError("check the code")
+            #     weight_parts.append(torch.zeros(prod(ins.path_shape), device=self.weight.device, dtype=self.weight.dtype))
+            #     continue
             
-            if self.S_r_list[ins_idx] is not None:
-                # Get SVD components for this instruction
-                U_r = getattr(self, f"U_r_{ins_idx}")
-                S_r = getattr(self, f"S_r_{ins_idx}")
-                Vh_r = getattr(self, f"Vh_r_{ins_idx}")
-                # Reconstruct: U @ diag(S) @ Vh
-                W_reconstructed = U_r @ torch.diag(S_r) @ Vh_r
+            # Get SVD components for this instruction
+            A_r = self.LORA_A_list[ins_idx]
+            B_r = self.LORA_B_list[ins_idx]
+
+            # residual from svd that remains fixed
+            path_shape = ins.path_shape  # (mul_in, mul_out)
+            weight_size = prod(path_shape)
+            # if using svd lora, the reconstructed weight is already the weight itself
+            # else, the reconstructed weight is just delta_W    
+            if hasattr(self, f"W_res_{ins_idx}"):
+                res_r = getattr(self, f"W_res_{ins_idx}")
+                W_ins = self.weight.data[..., offset:offset + weight_size]
+                mul_in, mul_out = path_shape
+                W_matrix = W_ins.reshape(mul_in, mul_out)
+                W_reconstructed = A_r @ B_r + res_r - W_matrix
             else:
-                U_r = getattr(self, f"U_r_{ins_idx}")
-                Vh_r = getattr(self, f"Vh_r_{ins_idx}")
-                W_reconstructed = U_r @ Vh_r
+                W_reconstructed = A_r @ B_r
             # Flatten and add to list
             weight_parts.append(W_reconstructed.flatten())
-        
+            offset += weight_size
+            
         # Concatenate all weight parts
         if len(weight_parts) == 0:
             return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
@@ -401,7 +407,7 @@ class Linear(CodeGenMixin, torch.nn.Module):
                 raise RuntimeError("Weights must be provided when internal_weights = False")
             weight = self.weight
             # Apply low-rank adaptation if SVD decomposition exists
-            if hasattr(self, "U_r_list") and any(x is not None for x in self.U_r_list):
+            if hasattr(self, "LORA_A_list"):
                 delta_weight = self.reconstruct_weight()
                 weight = weight + delta_weight
         if bias is None:

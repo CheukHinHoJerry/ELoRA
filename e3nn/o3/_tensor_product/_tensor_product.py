@@ -16,7 +16,7 @@ from ._instruction import Instruction
 
 @compile_mode('script')
 class TensorProduct(CodeGenMixin, torch.nn.Module):
-    r"""Tensor product with parametrized paths.
+    r"""Tensor product with parametrized paths and LoRA support.
 
     Parameters
     ----------
@@ -32,12 +32,6 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
     instructions : list of tuple
         List of instructions ``(i_1, i_2, i_out, mode, train[, path_weight])``.
 
-        Each instruction puts ``in1[i_1]`` :math:`\otimes` ``in2[i_2]`` into ``out[i_out]``.
-
-        * ``mode``: `str`. Determines the way the multiplicities are treated, ``"uvw"`` is fully connected. Other valid options are: ``'uvw'``, ``'uvu'``, ``'uvv'``, ``'uuw'``, ``'uuu'``, and ``'uvuv'``.
-        * ``train``: `bool`. `True` if this path should have learnable weights, otherwise `False`.
-        * ``path_weight``: `float`. A fixed multiplicative weight to apply to the output of this path. Defaults to 1. Note that setting ``path_weight`` breaks the normalization derived from ``in1_var``/``in2_var``/``out_var``.
-
     in1_var : list of float, Tensor, or None
         Variance for each irrep in ``irreps_in1``. If ``None``, all default to ``1.0``.
 
@@ -48,15 +42,10 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         Variance for each irrep in ``irreps_out``. If ``None``, all default to ``1.0``.
 
     irrep_normalization : {'component', 'norm'}
-        The assumed normalization of the input and output representations. If it is set to "norm":
-
-        .. math::
-
-            \| x \| = \| y \| = 1 \Longrightarrow \| x \otimes y \| = 1
+        The assumed normalization of the input and output representations.
 
     path_normalization : {'element', 'path'}
-        If set to ``element``, each output is normalized by the total number of elements (independently of their paths).
-        If it is set to ``path``, each path is normalized by the total number of elements in the path, then each output is normalized by the number of paths.
+        Normalization strategy for paths.
 
     internal_weights : bool
         whether the `e3nn.o3.TensorProduct` contains its learnable weights as a parameter
@@ -64,112 +53,11 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
     shared_weights : bool
         whether the learnable weights are shared among the input's extra dimensions
 
-        * `True` :math:`z_i = w x_i \otimes y_i`
-        * `False` :math:`z_i = w_i x_i \otimes y_i`
-
-        where here :math:`i` denotes a *batch-like* index.
-        ``shared_weights`` cannot be `False` if ``internal_weights`` is `True`.
-
     compile_left_right : bool
         whether to compile the forward function, true by default
 
     compile_right : bool
         whether to compile the ``.right`` function, false by default
-
-    Examples
-    --------
-    Create a module that computes elementwise the cross-product of 16 vectors with 16 vectors :math:`z_u = x_u \wedge y_u`
-
-    >>> module = TensorProduct(
-    ...     "16x1o", "16x1o", "16x1e",
-    ...     [
-    ...         (0, 0, 0, "uuu", False)
-    ...     ]
-    ... )
-
-    Now mix all 16 vectors with all 16 vectors to makes 16 pseudo-vectors :math:`z_w = \sum_{u,v} w_{uvw} x_u \wedge y_v`
-
-    >>> module = TensorProduct(
-    ...     [(16, (1, -1))],
-    ...     [(16, (1, -1))],
-    ...     [(16, (1,  1))],
-    ...     [
-    ...         (0, 0, 0, "uvw", True)
-    ...     ]
-    ... )
-
-    With custom input variance and custom path weights:
-
-    >>> module = TensorProduct(
-    ...     "8x0o + 8x1o",
-    ...     "16x1o",
-    ...     "16x1e",
-    ...     [
-    ...         (0, 0, 0, "uvw", True, 3),
-    ...         (1, 0, 0, "uvw", True, 1),
-    ...     ],
-    ...     in2_var=[1/16]
-    ... )
-
-    Example of a dot product:
-
-    >>> irreps = o3.Irreps("3x0e + 4x0o + 1e + 2o + 3o")
-    >>> module = TensorProduct(irreps, irreps, "0e", [
-    ...     (i, i, 0, 'uuw', False)
-    ...     for i, (mul, ir) in enumerate(irreps)
-    ... ])
-
-    Implement :math:`z_u = x_u \otimes (\sum_v w_{uv} y_v)`
-
-    >>> module = TensorProduct(
-    ...     "8x0o + 7x1o + 3x2e",
-    ...     "10x0e + 10x1e + 10x2e",
-    ...     "8x0o + 7x1o + 3x2e",
-    ...     [
-    ...         # paths for the l=0:
-    ...         (0, 0, 0, "uvu", True),  # 0x0->0
-    ...         # paths for the l=1:
-    ...         (1, 0, 1, "uvu", True),  # 1x0->1
-    ...         (1, 1, 1, "uvu", True),  # 1x1->1
-    ...         (1, 2, 1, "uvu", True),  # 1x2->1
-    ...         # paths for the l=2:
-    ...         (2, 0, 2, "uvu", True),  # 2x0->2
-    ...         (2, 1, 2, "uvu", True),  # 2x1->2
-    ...         (2, 2, 2, "uvu", True),  # 2x2->2
-    ...     ]
-    ... )
-
-    Tensor Product using the xavier uniform initialization:
-
-    >>> irreps_1 = o3.Irreps("5x0e + 10x1o + 1x2e")
-    >>> irreps_2 = o3.Irreps("5x0e + 10x1o + 1x2e")
-    >>> irreps_out = o3.Irreps("5x0e + 10x1o + 1x2e")
-    >>> # create a Fully Connected Tensor Product
-    >>> module = o3.TensorProduct(
-    ...     irreps_1,
-    ...     irreps_2,
-    ...     irreps_out,
-    ...     [
-    ...         (i_1, i_2, i_out, "uvw", True, mul_1 * mul_2)
-    ...         for i_1, (mul_1, ir_1) in enumerate(irreps_1)
-    ...         for i_2, (mul_2, ir_2) in enumerate(irreps_2)
-    ...         for i_out, (mul_out, ir_out) in enumerate(irreps_out)
-    ...         if ir_out in ir_1 * ir_2
-    ...     ]
-    ... )
-    >>> with torch.no_grad():
-    ...     for weight in module.weight_views():
-    ...         mul_1, mul_2, mul_out = weight.shape
-    ...         # formula from torch.nn.init.xavier_uniform_
-    ...         a = (6 / (mul_1 * mul_2 + mul_out))**0.5
-    ...         new_weight = torch.empty_like(weight)
-    ...         new_weight.uniform_(-a, a)
-    ...         weight[:] = new_weight
-    tensor(...)
-    >>> n = 1_000
-    >>> vars = module(irreps_1.randn(n, -1), irreps_2.randn(n, -1)).var(0)
-    >>> assert vars.min() > 1 / 3
-    >>> assert vars.max() < 3
     """
     instructions: List[Any]
     shared_weights: bool
@@ -196,11 +84,10 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         shared_weights: Optional[bool] = None,
         compile_left_right: bool = True,
         compile_right: bool = False,
-        normalization=None,  # for backward compatibility
+        normalization=None,
         _specialized_code: Optional[bool] = None,
         _optimize_einsums: Optional[bool] = None
     ):
-        # === Setup ===
         super().__init__()
 
         if normalization is not None:
@@ -251,19 +138,19 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             in1_var = [1.0 for _ in range(len(self.irreps_in1))]
         else:
             in1_var = [float(var) for var in in1_var]
-            assert len(in1_var) == len(self.irreps_in1), "Len of ir1_var must be equal to len(irreps_in1)"
+            assert len(in1_var) == len(self.irreps_in1)
 
         if in2_var is None:
             in2_var = [1.0 for _ in range(len(self.irreps_in2))]
         else:
             in2_var = [float(var) for var in in2_var]
-            assert len(in2_var) == len(self.irreps_in2), "Len of ir2_var must be equal to len(irreps_in2)"
+            assert len(in2_var) == len(self.irreps_in2)
 
         if out_var is None:
             out_var = [1.0 for _ in range(len(self.irreps_out))]
         else:
             out_var = [float(var) for var in out_var]
-            assert len(out_var) == len(self.irreps_out), "Len of out_var must be equal to len(irreps_out)"
+            assert len(out_var) == len(self.irreps_out)
 
         def num_elements(ins):
             return {
@@ -284,7 +171,6 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             mul_ir_out = self.irreps_out[ins.i_out]
             assert mul_ir_in1.ir.p * mul_ir_in2.ir.p == mul_ir_out.ir.p
             assert abs(mul_ir_in1.ir.l - mul_ir_in2.ir.l) <= mul_ir_out.ir.l <= mul_ir_in1.ir.l + mul_ir_in2.ir.l
-            assert ins.connection_mode in ['uvw', 'uvu', 'uvv', 'uuw', 'uuu', 'uvuv', 'uvu<v', 'u<vw']
 
             if irrep_normalization == 'component':
                 alpha = mul_ir_out.ir.dim
@@ -339,7 +225,6 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         self._optimize_einsums = _optimize_einsums if _optimize_einsums is not None else opt_defaults['optimize_einsums']
         del opt_defaults
 
-        # Generate the actual tensor product code
         if compile_left_right:
             graphmod_left_right = codegen_tensor_product_left_right(
                 self.irreps_in1,
@@ -357,7 +242,7 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             graphmod_left_right.placeholder('w', torch.Tensor)
             graphmod_left_right.call_function(
                 torch._assert,
-                args=(False, "`left_right` method is not compiled, set `compile_left_right` to True when creating the TensorProduct")
+                args=(False, "`left_right` method is not compiled")
             )
             graphmod_left_right = fx.GraphModule(torch.nn.Module(), graphmod_left_right, class_name="tp_forward")
 
@@ -377,7 +262,7 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             graphmod_right.placeholder('w', torch.Tensor)
             graphmod_right.call_function(
                 torch._assert,
-                args=(False, "`right` method is not compiled, set `compile_right` to True when creating the TensorProduct")
+                args=(False, "`right` method is not compiled")
             )
             graphmod_right = fx.GraphModule(torch.nn.Module(), graphmod_right, class_name="tp_forward")
 
@@ -386,23 +271,36 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             "_compiled_main_right": graphmod_right
         })
 
-        # === Determine weights ===
         self.weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.has_weight)
 
-        # LoRA attributes initialization (similar to Linear)
+        # LoRA attributes initialization
         self.alpha = 16
         self.r = 16
-        self.LoRA_weight_numel = sum(
-            self._get_lora_params_for_instruction(ins) 
-            for ins in self.instructions if ins.has_weight
-        )
+        # Calculate LoRA weight numel based on path shapes
+        lora_numel = 0
+        for ins in self.instructions:
+            if ins.has_weight:
+                if len(ins.path_shape) >= 2:
+                    # For 2D or 3D weight matrices
+                    if len(ins.path_shape) == 3:
+                        # uvw mode: flatten first two dims
+                        rows = ins.path_shape[0] * ins.path_shape[1]
+                        cols = ins.path_shape[2]
+                    else:
+                        # 2D modes
+                        rows = ins.path_shape[0]
+                        cols = ins.path_shape[1]
+                    lora_numel += rows * self.r + self.r * cols
+                else:
+                    # 1D path_shape - treat as column vector
+                    lora_numel += ins.path_shape[0] * self.r + self.r
+        self.LoRA_weight_numel = lora_numel
 
         if internal_weights and self.weight_numel > 0:
             assert self.shared_weights, "Having internal weights impose shared weights"
             self.weight = torch.nn.Parameter(torch.randn(self.weight_numel))
         else:
             self.register_buffer('weight', torch.Tensor())
-            
 
         if self.irreps_out.dim > 0:
             output_mask = torch.cat([
@@ -418,50 +316,131 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             output_mask = torch.ones(0)
         self.register_buffer('output_mask', output_mask)
 
-        # For TorchScript, this needs to be done in advance:
         self._profiling_str = str(self)
-
-    def _get_lora_params_for_instruction(self, ins):
-        """Calculate LoRA parameter count for an instruction based on its connection mode."""
-        path_shape = ins.path_shape
-        
-        if ins.connection_mode == 'uvw':
-            # (mul_in1, mul_in2, mul_out) -> matrix form (mul_in1*mul_in2, mul_out)
-            m, n = path_shape[0] * path_shape[1], path_shape[2]
-        elif ins.connection_mode in ['uvu', 'uvv', 'uuw']:
-            # Already 2D
-            if len(path_shape) == 2:
-                m, n = path_shape
-            else:
-                m, n = path_shape[0], 1
-        elif ins.connection_mode == 'u<vw':
-            # 2D: (combined, mul_out)
-            m, n = path_shape if len(path_shape) == 2 else (path_shape[0], 1)
-        else:
-            # For 1D cases like 'uuu', 'uvuv', 'uvu<v'
-            m, n = path_shape[0] if len(path_shape) == 1 else prod(path_shape), 1
-        
-        # LoRA params: U (m x r) + Vh (r x n) but we only train S (r,)
-        return m * self.r + self.r * n
 
     def __repr__(self):
         npath = sum(prod(i.path_shape) for i in self.instructions)
-        svd_info = ""
-        if hasattr(self, 'U_r_list'):
-            n_svd = len([x for x in self.U_r_list if x is not None])
-            svd_info = f" | {n_svd} SVD instructions"
         return (
             f"{self.__class__.__name__}"
             f"({self.irreps_in1.simplify()} x {self.irreps_in2.simplify()} "
-            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights{svd_info})"
+            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
         )
-    # def __repr__(self):
-    #     npath = sum(prod(i.path_shape) for i in self.instructions)
-    #     return (
-    #         f"{self.__class__.__name__}"
-    #         f"({self.irreps_in1.simplify()} x {self.irreps_in2.simplify()} "
-    #         f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
-    #     )
+
+    def compute_deltaW_via_svd(self):
+        """Compute SVD per instruction and store top-rank factors (A, B trainable)."""
+        if not hasattr(self, "weight") or self.weight.numel() == 0:
+            return
+        
+        self.LORA_A_list = []
+        self.LORA_B_list = []
+        self.instruction_offsets = []
+        self.S_r_list = []
+        
+        with torch.no_grad():
+            offset = 0
+            for ins_idx, ins in enumerate(self.instructions):
+                if not ins.has_weight:
+                    continue
+                
+                path_shape = ins.path_shape
+                weight_size = prod(path_shape)
+                W_ins = self.weight.data[offset:offset + weight_size]
+                
+                # Reshape based on connection mode and path_shape
+                if ins.connection_mode == 'uvw' and len(path_shape) == 3:
+                    # Flatten first two dimensions for matrix decomposition
+                    mul_in1, mul_in2, mul_out = path_shape
+                    W_matrix = W_ins.reshape(mul_in1 * mul_in2, mul_out)
+                elif len(path_shape) == 2:
+                    # 2D weight matrix
+                    W_matrix = W_ins.reshape(path_shape)
+                elif len(path_shape) == 1:
+                    # 1D weight - treat as column vector
+                    W_matrix = W_ins.reshape(-1, 1)
+                else:
+                    raise ValueError(f"Unexpected path_shape length: {len(path_shape)}")
+                
+                print(f"Instruction {ins_idx}: mode={ins.connection_mode}, "
+                      f"path_shape={path_shape}, matrix_shape={W_matrix.shape}")
+                
+                # Perform SVD
+                U, S, Vh = torch.linalg.svd(W_matrix, full_matrices=False)
+                r = min(self.r, S.size(0))
+                
+                if r >= self.r:
+                    print(f"rank {r}")
+                    # Store components: A = U * sqrt(S), B = sqrt(S) * Vh
+                    self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
+                    self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
+                    
+                    # Store residual (not trainable)
+                    self.S_r_list.append(S[r:].clone())
+                    self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
+                    self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
+                else:
+                    print(f"rank {r} < {self.r}, using random initialization instead")
+                    self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device=U.device)))
+                    self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device=Vh.device)))
+                    
+                    self.S_r_list.append(None)
+                    self.register_buffer(f"S_r_{ins_idx}", None)
+                
+                self.instruction_offsets.append(offset)
+                offset += weight_size
+        
+        self.LORA_A_list = torch.nn.ParameterList(self.LORA_A_list)
+        self.LORA_B_list = torch.nn.ParameterList(self.LORA_B_list)
+        print(f"[TensorProduct] SVD decomposition complete for {len(self.LORA_A_list)} instructions")
+
+    def reconstruct_weight(self):
+        """Low-rank reconstruction from A and B matrices."""
+        if not hasattr(self, 'LORA_A_list'):
+            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
+        
+        weight_parts = []
+        lora_idx = 0
+        offset = 0
+        
+        for ins_idx, ins in enumerate(self.instructions):
+            if not ins.has_weight:
+                continue
+            
+            A_r = self.LORA_A_list[lora_idx]
+            B_r = self.LORA_B_list[lora_idx]
+            
+            # Reconstruct weight matrix
+            W_reconstructed = A_r @ B_r
+            
+            # Add residual if using SVD LoRA
+            if hasattr(self, f"W_res_{ins_idx}"):
+                res_r = getattr(self, f"W_res_{ins_idx}")
+                # Get original weight for this instruction
+                path_shape = ins.path_shape
+                weight_size = prod(path_shape)
+                W_ins = self.weight.data[offset:offset + weight_size]
+                
+                # Reshape to match W_reconstructed shape
+                if ins.connection_mode == 'uvw' and len(path_shape) == 3:
+                    mul_in1, mul_in2, mul_out = path_shape
+                    W_matrix = W_ins.reshape(mul_in1 * mul_in2, mul_out)
+                elif len(path_shape) == 2:
+                    W_matrix = W_ins.reshape(path_shape)
+                elif len(path_shape) == 1:
+                    W_matrix = W_ins.reshape(-1, 1)
+                else:
+                    W_matrix = W_ins
+                
+                # Compute delta: reconstructed + residual - original
+                W_reconstructed = W_reconstructed + res_r - W_matrix
+            
+            weight_parts.append(W_reconstructed.flatten())
+            lora_idx += 1
+            offset += prod(ins.path_shape)
+        
+        if len(weight_parts) == 0:
+            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
+        
+        return torch.cat(weight_parts)
 
     @torch.jit.unused
     def _prep_weights_python(self, weight: Optional[Union[torch.Tensor, List[torch.Tensor]]]) -> Optional[torch.Tensor]:
@@ -477,241 +456,46 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
 
     def _get_weights(self, weight: Optional[torch.Tensor]) -> torch.Tensor:
         if not torch.jit.is_scripting():
-            # If we're not scripting, then we're in Python and `weight` could be a List[Tensor]
-            # deal with that:
             weight = self._prep_weights_python(weight)
         if weight is None:
             if self.weight_numel > 0 and not self.internal_weights:
-                raise RuntimeError("Weights must be provided when the TensorProduct does not have `internal_weights`")
-            return self.weight
-        else:
+                raise RuntimeError("Weights must be provided when internal_weights = False")
+            weight = self.weight
+            # Apply low-rank adaptation if SVD decomposition exists
+            if hasattr(self, "LORA_A_list"):
+                delta_weight = self.reconstruct_weight()
+                weight = weight + delta_weight
+        if weight is not None:
             if self.shared_weights:
                 assert weight.shape == (self.weight_numel,), "Invalid weight shape"
             else:
                 assert weight.shape[-1] == self.weight_numel, "Invalid weight shape"
                 assert weight.ndim > 1, "When shared weights is false, weights must have batch dimension"
-            return weight
+        return weight
 
     @torch.jit.export
     def right(self, y, weight: Optional[torch.Tensor] = None):
-        r"""Partially evaluate :math:`w x \otimes y`.
-
-        It returns an operator in the form of a tensor that can act on an arbitrary :math:`x`.
-
-        For example, if the tensor product above is expressed as
-
-        .. math::
-
-            w_{ijk} x_i y_j \rightarrow z_k
-
-        then the right method returns a tensor :math:`b_{ik}` such that
-
-        .. math::
-
-            w_{ijk} y_j \rightarrow b_{ik}
-            x_i b_{ik} \rightarrow z_k
-
-        The result of this method can be applied with a tensor contraction:
-
-        .. code-block:: python
-
-            torch.einsum("...ik,...i->...k", right, input)
-
-        Parameters
-        ----------
-        y : `torch.Tensor`
-            tensor of shape ``(..., irreps_in2.dim)``
-
-        weight : `torch.Tensor` or list of `torch.Tensor`, optional
-            required if ``internal_weights`` is ``False``
-            tensor of shape ``(self.weight_numel,)`` if ``shared_weights`` is ``True``
-            tensor of shape ``(..., self.weight_numel)`` if ``shared_weights`` is ``False``
-            or list of tensors of shapes ``weight_shape`` / ``(...) + weight_shape``.
-            Use ``self.instructions`` to know what are the weights used for.
-
-        Returns
-        -------
-        `torch.Tensor`
-            tensor of shape ``(..., irreps_in1.dim, irreps_out.dim)``
-        """
+        r"""Partially evaluate w x ⊗ y."""
         assert y.shape[-1] == self._in2_dim, "Incorrect last dimension for y"
-
         real_weight = self._get_weights(weight)
-    
-        # Apply low-rank adaptation if SVD decomposition exists
-        if hasattr(self, "U_r_list") and any(x is not None for x in self.U_r_list):
-            delta_weight = self.reconstruct_weight()
-            real_weight = real_weight + delta_weight
-        
         return self._compiled_main_right(y, real_weight)
 
-    def compute_deltaW_via_svd(self):
-        """Compute SVD per instruction and store top-rank factors."""
-        if not hasattr(self, "weight") or self.weight.numel() == 0:
-            return
-        
-        self.U_r_list = []
-        self.Vh_r_list = []
-        self.S_r_list = []
-        self.instruction_offsets = []
-        
-        with torch.no_grad():
-            offset = 0
-            for ins_idx, ins in enumerate(self.instructions):
-                if not ins.has_weight:
-                    self.U_r_list.append(None)
-                    self.Vh_r_list.append(None)
-                    self.S_r_list.append(None)
-                    continue
-                
-                path_shape = ins.path_shape
-                weight_size = prod(path_shape)
-                W_ins = self.weight.data[offset:offset + weight_size]
-                
-                # Reshape based on connection mode
-                if ins.connection_mode == 'uvw':
-                    mul_in1, mul_in2, mul_out = path_shape
-                    W_matrix = W_ins.reshape(mul_in1 * mul_in2, mul_out)
-                elif ins.connection_mode in ['uvu', 'uvv', 'uuw']:
-                    if len(path_shape) == 2:
-                        W_matrix = W_ins.reshape(path_shape)
-                    else:
-                        W_matrix = W_ins.reshape(-1, 1)
-                elif ins.connection_mode == 'u<vw':
-                    W_matrix = W_ins.reshape(path_shape) if len(path_shape) == 2 else W_ins.reshape(-1, 1)
-                elif ins.connection_mode in ['uuu', 'uvuv', 'uvu<v']:
-                    W_matrix = W_ins.reshape(-1, 1) if len(path_shape) == 1 else W_ins.reshape(path_shape)
-                else:
-                    raise ValueError(f"Unknown connection mode: {ins.connection_mode}")
-                
-                print(f"Instruction {ins_idx}: mode={ins.connection_mode}, "
-                    f"path_shape={path_shape}, matrix_shape={W_matrix.shape}")
-                
-                # Perform SVD
-                U, S, Vh = torch.linalg.svd(W_matrix, full_matrices=False)
-                r = min(self.r, S.size(0))
-                
-                if r >= self.r:
-                    # Store frozen U, Vh and trainable S
-                    self.register_buffer(f"U_r_{ins_idx}", U[:, :r])
-                    self.register_buffer(f"Vh_r_{ins_idx}", Vh[:r, :])
-                    setattr(self, f"S_r_{ins_idx}", torch.nn.Parameter(S[:r].clone() * 0.0))
-                    
-                    self.U_r_list.append(U[:, :r])
-                    self.Vh_r_list.append(Vh[:r, :])
-                    self.S_r_list.append(torch.nn.Parameter(S[:r].clone() * 0.0))
-                else:
-                    print(f"rank {r} < {self.r}, using random initialization instead")
-                    # Use trainable U and Vh for small matrices
-                    setattr(self, f"U_r_{ins_idx}", torch.nn.Parameter(
-                        torch.randn(U[:, :r].shape, device=U.device)
-                    ))
-                    setattr(self, f"Vh_r_{ins_idx}", torch.nn.Parameter(
-                        torch.zeros(Vh[:r, :].shape, device=Vh.device)
-                    ))
-                    self.register_buffer(f"S_r_{ins_idx}", None)
-                    
-                    self.U_r_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape)))
-                    self.Vh_r_list.append(torch.nn.Parameter(torch.randn(Vh[:r, :].shape)))
-                    self.S_r_list.append(None)
-                
-                self.instruction_offsets.append(offset)
-                offset += weight_size
-        
-        print(f"[TensorProduct] SVD decomposition complete for {len([x for x in self.U_r_list if x is not None])} instructions")
-    
-    def reconstruct_weight(self):
-        """Low-rank reconstruction from SVD components."""
-        if not hasattr(self, 'U_r_list'):
-            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
-        
-        weight_parts = []
-        
-        for ins_idx, ins in enumerate(self.instructions):
-            if not ins.has_weight:
-                continue
-            
-            if self.U_r_list[ins_idx] is None:
-                weight_parts.append(torch.zeros(prod(ins.path_shape), device=self.weight.device, dtype=self.weight.dtype))
-                continue
-            
-            U_r = getattr(self, f"U_r_{ins_idx}")
-            Vh_r = getattr(self, f"Vh_r_{ins_idx}")
-            S_r = getattr(self, f"S_r_{ins_idx}")
-            
-            if S_r is not None:
-                # Reconstruct with diagonal S
-                W_reconstructed = U_r @ torch.diag(S_r) @ Vh_r
-            else:
-                # Direct multiplication for trainable U, Vh
-                W_reconstructed = U_r @ Vh_r
-            
-            weight_parts.append(W_reconstructed.flatten())
-        
-        if len(weight_parts) == 0:
-            return torch.zeros(self.weight_numel, device=self.weight.device, dtype=self.weight.dtype)
-        
-        return torch.cat(weight_parts)
-
-
     def forward(self, x, y, weight: Optional[torch.Tensor] = None):
-        r"""Evaluate :math:`w x \otimes y`.
-
-        Parameters
-        ----------
-        x : `torch.Tensor`
-            tensor of shape ``(..., irreps_in1.dim)``
-
-        y : `torch.Tensor`
-            tensor of shape ``(..., irreps_in2.dim)``
-
-        weight : `torch.Tensor` or list of `torch.Tensor`, optional
-            required if ``internal_weights`` is ``False``
-            tensor of shape ``(self.weight_numel,)`` if ``shared_weights`` is ``True``
-            tensor of shape ``(..., self.weight_numel)`` if ``shared_weights`` is ``False``
-            or list of tensors of shapes ``weight_shape`` / ``(...) + weight_shape``.
-            Use ``self.instructions`` to know what are the weights used for.
-
-        Returns
-        -------
-        `torch.Tensor`
-            tensor of shape ``(..., irreps_out.dim)``
-        """
+        r"""Evaluate w x ⊗ y."""
         assert x.shape[-1] == self._in1_dim, "Incorrect last dimension for x"
         assert y.shape[-1] == self._in2_dim, "Incorrect last dimension for y"
-
         real_weight = self._get_weights(weight)
-        
-        # Apply low-rank adaptation if SVD decomposition exists
-        if hasattr(self, "U_r_list") and any(x is not None for x in self.U_r_list):
-            delta_weight = self.reconstruct_weight()
-            real_weight = real_weight + delta_weight
-        
         return self._compiled_main_left_right(x, y, real_weight)
-        
+
     def weight_view_for_instruction(
         self,
         instruction: int,
         weight: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        r"""View of weights corresponding to ``instruction``.
-
-        Parameters
-        ----------
-        instruction : int
-            The index of the instruction to get a view on the weights for. ``self.instructions[instruction].has_weight`` must be ``True``.
-
-        weight : `torch.Tensor`, optional
-            like ``weight`` argument to ``forward()``
-
-        Returns
-        -------
-        `torch.Tensor`
-            A view on ``weight`` or this object's internal weights for the weights corresponding to the ``instruction`` th instruction.
-        """
+        r"""View of weights corresponding to instruction."""
         if not self.instructions[instruction].has_weight:
             raise ValueError(f"Instruction {instruction} has no weights.")
-        offset = sum(prod(ins.path_shape) for ins in self.instructions[:instruction])
+        offset = sum(prod(ins.path_shape) for ins in self.instructions[:instruction] if ins.has_weight)
         ins = self.instructions[instruction]
         weight = self._get_weights(weight)
         batchshape = weight.shape[:-1]
@@ -722,21 +506,7 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         weight: Optional[torch.Tensor] = None,
         yield_instruction: bool = False
     ):
-        r"""Iterator over weight views for each weighted instruction.
-
-        Parameters
-        ----------
-        weight : `torch.Tensor`, optional
-            like ``weight`` argument to ``forward()``
-
-        yield_instruction : `bool`, default False
-            Whether to also yield the corresponding instruction.
-
-        Yields
-        ------
-        If ``yield_instruction`` is ``True``, yields ``(instruction_index, instruction, weight_view)``.
-        Otherwise, yields ``weight_view``.
-        """
+        r"""Iterator over weight views for each weighted instruction."""
         weight = self._get_weights(weight)
         batchshape = weight.shape[:-1]
         offset = 0
@@ -750,223 +520,28 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
                 else:
                     yield this_weight
 
-    def visualize(
-        self,
-        weight: Optional[torch.Tensor] = None,
-        plot_weight: bool = True,
-        aspect_ratio=1,
-        ax=None
-    ):  # pragma: no cover
-        r"""Visualize the connectivity of this `e3nn.o3.TensorProduct`
-
-        Parameters
-        ----------
-        weight : `torch.Tensor`, optional
-            like ``weight`` argument to ``forward()``
-
-        plot_weight : `bool`, default True
-            Whether to color paths by the sum of their weights.
-
-        ax : ``matplotlib.Axes``, default None
-            The axes to plot on. If ``None``, a new figure will be created.
-
-        Returns
-        -------
-        (fig, ax)
-            The figure and axes on which the plot was drawn.
-        """
-        import numpy as np
-
-        def _intersection(x, u, y, v):
-            u2 = np.sum(u**2)
-            v2 = np.sum(v**2)
-            uv = np.sum(u * v)
-            det = u2 * v2 - uv**2
-            mu = np.sum((u * uv - v * u2) * (y - x)) / det
-            return y + mu * v
-
-        import matplotlib
-        import matplotlib.pyplot as plt
-        from matplotlib import patches
-        from matplotlib.path import Path
-
-        if ax is None:
-            ax = plt.gca()
-
-        fig = ax.get_figure()
-
-        # hexagon
-        verts = [
-            np.array([np.cos(a * 2 * np.pi / 6), np.sin(a * 2 * np.pi / 6)])
-            for a in range(6)
-        ]
-        verts = np.asarray(verts)
-
-        # scale it
-        assert aspect_ratio in ['auto'] or isinstance(aspect_ratio, (float, int))
-
-        if aspect_ratio == 'auto':
-            factor = 0.2 / 2
-            min_aspect = 1 / 2
-            h_factor = max(len(self.irreps_in2), len(self.irreps_in1))
-            w_factor = len(self.irreps_out)
-            if h_factor / w_factor < min_aspect:
-                h_factor = min_aspect * w_factor
-            verts[:, 1] *= h_factor * factor
-            verts[:, 0] *= w_factor * factor
-
-        if isinstance(aspect_ratio, (float, int)):
-            factor = 0.1 * max(len(self.irreps_in2), len(self.irreps_in1), len(self.irreps_out))
-            verts[:, 1] *= factor
-            verts[:, 0] *= aspect_ratio * factor
-
-        codes = [
-            Path.MOVETO,
-            Path.LINETO,
-
-            Path.MOVETO,
-            Path.LINETO,
-
-            Path.MOVETO,
-            Path.LINETO,
-        ]
-
-        path = Path(verts, codes)
-        patch = patches.PathPatch(path, facecolor='none', lw=1, zorder=2)
-        ax.add_patch(patch)
-
-        n = len(self.irreps_in1)
-        b, a = verts[2:4]
-
-        c_in1 = (a + b) / 2
-        s_in1 = [a + (i + 1) / (n + 1) * (b - a) for i in range(n)]
-
-        n = len(self.irreps_in2)
-        b, a = verts[:2]
-
-        c_in2 = (a + b) / 2
-        s_in2 = [a + (i + 1) / (n + 1) * (b - a) for i in range(n)]
-
-        n = len(self.irreps_out)
-        a, b = verts[4:6]
-
-        s_out = [a + (i + 1) / (n + 1) * (b - a) for i in range(n)]
-
-        # get weights
-        if weight is None and not self.internal_weights:
-            plot_weight = False
-        elif plot_weight:
-            with torch.no_grad():
-                path_weight = []
-                for ins_i, ins in enumerate(self.instructions):
-                    if ins.has_weight:
-                        this_weight = self.weight_view_for_instruction(ins_i, weight=weight)
-                        path_weight.append(this_weight.pow(2).mean())
-                    else:
-                        path_weight.append(0)
-                path_weight = np.asarray(path_weight)
-                path_weight /= np.abs(path_weight).max()
-        cmap = matplotlib.cm.get_cmap('Blues')
-
-        for ins_index, ins in enumerate(self.instructions):
-            y = _intersection(s_in1[ins.i_in1], c_in1, s_in2[ins.i_in2], c_in2)
-
-            verts = []
-            codes = []
-            verts += [s_out[ins.i_out], y]
-            codes += [Path.MOVETO, Path.LINETO]
-            verts += [s_in1[ins.i_in1], y]
-            codes += [Path.MOVETO, Path.LINETO]
-            verts += [s_in2[ins.i_in2], y]
-            codes += [Path.MOVETO, Path.LINETO]
-
-            if plot_weight:
-                color = cmap(0.5 + 0.5 * path_weight[ins_index]) if ins.has_weight else 'black'
-            else:
-                color = 'green' if ins.has_weight else 'black'
-
-            ax.add_patch(patches.PathPatch(
-                Path(verts, codes),
-                facecolor='none',
-                edgecolor=color,
-                alpha=0.5,
-                ls='-',
-                lw=1.5,
-            ))
-
-        # add labels
-        padding = 3
-        fontsize = 10
-
-        def format_ir(mul_ir):
-            if mul_ir.mul == 1:
-                return f"${mul_ir.ir}$"
-            return f"${mul_ir.mul} \\times {mul_ir.ir}$"
-
-        for i, mul_ir in enumerate(self.irreps_in1):
-            ax.annotate(
-                format_ir(mul_ir),
-                s_in1[i],
-                horizontalalignment='right',
-                textcoords='offset points',
-                xytext=(-padding, 0),
-                fontsize=fontsize
-            )
-
-        for i, mul_ir in enumerate(self.irreps_in2):
-            ax.annotate(
-                format_ir(mul_ir),
-                s_in2[i],
-                horizontalalignment='left',
-                textcoords='offset points',
-                xytext=(padding, 0),
-                fontsize=fontsize
-            )
-
-        for i, mul_ir in enumerate(self.irreps_out):
-            ax.annotate(
-                format_ir(mul_ir),
-                s_out[i],
-                horizontalalignment='center',
-                verticalalignment='top',
-                rotation=90,
-                textcoords='offset points',
-                xytext=(0, -padding),
-                fontsize=fontsize
-            )
-
-        ax.set_xlim(-2, 2)
-        ax.set_ylim(-2, 2)
-        ax.axis('equal')
-        ax.axis('off')
-
-        return fig, ax
-
     def merge_LoRA(self):
         """Merge the low-rank SVD updates back into the main weight."""
-        if not hasattr(self, 'U_r_list'):
-            return  # No SVD decomposition to merge
+        if not hasattr(self, 'LORA_A_list'):
+            return
         
         # Add reconstructed delta to original weight
-        scaling = self.alpha / self.r if hasattr(self, 'alpha') and hasattr(self, 'r') else 1.0
-        self.weight.data = self.weight.data + scaling * self.reconstruct_weight()
+        self.weight.data = self.weight.data + self.reconstruct_weight()
         
-        # Clean up all SVD components for each instruction
-        for ins_idx in range(len(self.instructions)):
-            # Delete buffers
-            if hasattr(self, f"U_r_{ins_idx}"):
-                delattr(self, f"U_r_{ins_idx}")
-            if hasattr(self, f"Vh_r_{ins_idx}"):
-                delattr(self, f"Vh_r_{ins_idx}")
-            # Delete parameters
-            if hasattr(self, f"S_r_{ins_idx}"):
-                delattr(self, f"S_r_{ins_idx}")
+        # Clean up all SVD components
+        for ins_idx, ins in enumerate(self.instructions):
+            if ins.has_weight:
+                # Delete buffers
+                if hasattr(self, f"S_r_{ins_idx}"):
+                    delattr(self, f"S_r_{ins_idx}")
+                if hasattr(self, f"W_res_{ins_idx}"):
+                    delattr(self, f"W_res_{ins_idx}")
         
-        # Clean up the lists and other attributes
-        if hasattr(self, 'U_r_list'):
-            del self.U_r_list
-        if hasattr(self, 'Vh_r_list'):
-            del self.Vh_r_list
+        # Clean up lists and attributes
+        if hasattr(self, 'LORA_A_list'):
+            del self.LORA_A_list
+        if hasattr(self, 'LORA_B_list'):
+            del self.LORA_B_list
         if hasattr(self, 'S_r_list'):
             del self.S_r_list
         if hasattr(self, 'instruction_offsets'):
@@ -977,18 +552,3 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             del self.r
         if hasattr(self, 'LoRA_weight_numel'):
             del self.LoRA_weight_numel
-
-
-    # def merge_LoRA(self):
-    #     if self.LoRA_weight_numel > 0:
-    #         LoRA_weight = []
-    #         for index, v in enumerate(self.LoRA_weight):
-    #             if index % 2 == 0:
-    #                 LoRA_weight.append(v)
-    #             else:
-    #                 LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-    #         self.weight.data = self.weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
-    #     del self.LoRA_weight
-    #     del self.alpha
-    #     del self.r
-    #     del self.LoRA_weight_numel

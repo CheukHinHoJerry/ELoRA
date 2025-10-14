@@ -50,29 +50,22 @@ class _Layer(torch.nn.Module):
 
             # Truncate to top-rank components
             r = min(self.r, S.size(0))
-            U_r = U[:, :r]
-            S_r = S[:r]
-            Vh_r = Vh[:r, :]
-
-        # Keep U and Vh fixed
-        self.register_buffer("U_r", U_r)
-        self.register_buffer("Vh_r", Vh_r)
-
-        # Only S is trainable
-        self.S_r = torch.nn.Parameter(S_r.clone() * 0.0)
+            self.LORA_A = torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5))
+            self.LORA_B = torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone())
+            self.register_buffer("W_res", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
 
     def reconstruct_weight(self):
         """Reconstruct low-rank weight approximation."""
-        return self.U_r @ torch.diag(self.S_r) @ self.Vh_r
+        return self.LORA_A @ self.LORA_B + self.W_res
 
     def forward(self, x: torch.Tensor):
         # - PROFILER - with torch.autograd.profiler.record_function(self._profiling_str):
         
         # init weight from lora
-        if hasattr(self, "U_r"):
-            weight = self.weight + self.reconstruct_weight()
-        else:
-            weight = self.weight
+        # if hasattr(self, "W_res"):
+        #     weight = self.reconstruct_weight()
+        # else:
+        weight = self.weight
 
         # forward
         if self.act is not None:
@@ -86,11 +79,10 @@ class _Layer(torch.nn.Module):
         return x
     
     def merge_LoRA(self):
-        self.weight.data = self.weight + self.reconstruct_weight() # + self.alpha / self.r * self.LoRA_weight[0] @ self.LoRA_weight[1]
-        # del self.LoRA_weight
-        del self.S_r
-        del self.U_r
-        del self.Vh_r
+        self.weight.data = self.reconstruct_weight() 
+        del self.LORA_A
+        del self.LORA_B
+        del self.W_res
         del self.alpha
         del self.r
 
