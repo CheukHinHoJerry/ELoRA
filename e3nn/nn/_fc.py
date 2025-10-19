@@ -62,10 +62,10 @@ class _Layer(torch.nn.Module):
         # - PROFILER - with torch.autograd.profiler.record_function(self._profiling_str):
         
         # init weight from lora
-        # if hasattr(self, "W_res"):
-        #     weight = self.reconstruct_weight()
-        # else:
-        weight = self.weight
+        if hasattr(self, "W_res"):
+            weight = self.reconstruct_weight()
+        else:
+            weight = self.weight
 
         # forward
         if self.act is not None:
