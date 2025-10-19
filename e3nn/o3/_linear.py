@@ -264,7 +264,7 @@ class Linear(CodeGenMixin, torch.nn.Module):
         self.register_buffer('output_mask', output_mask)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
+        return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights | {self.LoRA_weight_numel} SVD ELoRA_weights)"
 
     def compute_deltaW_via_svd(self):
         """Compute SVD per instruction/irrep and store top-rank factors (U,Vh fixed)."""
@@ -311,26 +311,26 @@ class Linear(CodeGenMixin, torch.nn.Module):
                 # Determine rank for this instruction
                 r = min(self.r, S.size(0))
                 
-                if r >= self.r:
-                    print("rank", r)
-                    # Store components as buffers/parameters
-                    self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
-                    self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
-                    
-                    # not in use
-                    self.S_r_list.append(S[r:].clone())
-                    self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
-                    self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
-                else:
-                    print(f"rank {r} < {self.r}, using typical random initi instead")
-                    # randomly full in matrix but make U and Vh trainable and of size 
-                    # set U and Vh to be trainble like A and B in the paper
-                    self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device = U.device)))
-                    self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device = Vh.device)))
+                #if r >= self.r:
+                print("rank in linear", r)
+                # Store components as buffers/parameters
+                self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
+                self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
+                
+                # not in use
+                self.S_r_list.append(S[r:].clone())
+                self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
+                self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
+                # else:
+                #     print(f"rank {r} < {self.r}, using typical random initi instead")
+                #     # randomly full in matrix but make U and Vh trainable and of size 
+                #     # set U and Vh to be trainble like A and B in the paper
+                #     self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device = U.device)))
+                #     self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device = Vh.device)))
 
-                    # not in use these are just dummies that are not used in the actual .forward
-                    self.S_r_list.append(None)
-                    self.register_buffer(f"S_r_{ins_idx}", None)
+                #     # not in use these are just dummies that are not used in the actual .forward
+                #     self.S_r_list.append(None)
+                #     self.register_buffer(f"S_r_{ins_idx}", None)
 
                 self.instruction_offsets.append(offset)
                 offset += weight_size

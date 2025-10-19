@@ -323,7 +323,7 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         return (
             f"{self.__class__.__name__}"
             f"({self.irreps_in1.simplify()} x {self.irreps_in2.simplify()} "
-            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
+            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights | {self.LoRA_weight_numel} SVD ELoRA_weights)"
         )
 
     def compute_deltaW_via_svd(self):
@@ -361,29 +361,29 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
                     raise ValueError(f"Unexpected path_shape length: {len(path_shape)}")
                 
                 print(f"Instruction {ins_idx}: mode={ins.connection_mode}, "
-                      f"path_shape={path_shape}, matrix_shape={W_matrix.shape}")
+                        f"path_shape={path_shape}, matrix_shape={W_matrix.shape}")
                 
                 # Perform SVD
                 U, S, Vh = torch.linalg.svd(W_matrix, full_matrices=False)
                 r = min(self.r, S.size(0))
                 
-                if r >= self.r:
-                    print(f"rank {r}")
-                    # Store components: A = U * sqrt(S), B = sqrt(S) * Vh
-                    self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
-                    self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
+                # if r >= self.r:
+                print(f"rank in tensor product {r}")
+                # Store components: A = U * sqrt(S), B = sqrt(S) * Vh
+                self.LORA_A_list.append(torch.nn.Parameter(U[:, :r].clone() @ torch.diag(S[:r].clone() ** 0.5)))
+                self.LORA_B_list.append(torch.nn.Parameter(torch.diag(S[:r].clone() ** 0.5) @ Vh[:r, :].clone()))
+                
+                # Store residual (not trainable)
+                self.S_r_list.append(S[r:].clone())
+                self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
+                self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
+                # else:
+                #     print(f"rank {r} < {self.r}, using random initialization instead")
+                #     self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device=U.device)))
+                #     self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device=Vh.device)))
                     
-                    # Store residual (not trainable)
-                    self.S_r_list.append(S[r:].clone())
-                    self.register_buffer(f"S_r_{ins_idx}", S[r:].clone())
-                    self.register_buffer(f"W_res_{ins_idx}", U[:, r:].clone() @ torch.diag(S[r:].clone()) @ Vh[r:, :].clone())
-                else:
-                    print(f"rank {r} < {self.r}, using random initialization instead")
-                    self.LORA_A_list.append(torch.nn.Parameter(torch.randn(U[:, :r].shape, device=U.device)))
-                    self.LORA_B_list.append(torch.nn.Parameter(torch.zeros(Vh[:r, :].shape, device=Vh.device)))
-                    
-                    self.S_r_list.append(None)
-                    self.register_buffer(f"S_r_{ins_idx}", None)
+                #     self.S_r_list.append(None)
+                #     self.register_buffer(f"S_r_{ins_idx}", None)
                 
                 self.instruction_offsets.append(offset)
                 offset += weight_size
