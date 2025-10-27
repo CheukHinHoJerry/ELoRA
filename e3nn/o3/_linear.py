@@ -224,16 +224,6 @@ class Linear(CodeGenMixin, torch.nn.Module):
         if internal_weights and self.weight_numel > 0:
             assert self.shared_weights, "Having internal weights impose shared weights"
             self.weight = torch.nn.Parameter(torch.randn(*((f_in, f_out) if f_in is not None else ()), self.weight_numel))
-            # LoRA weights initialization
-            self.LoRA_weight = []
-            self.alpha = 16
-            self.r = 16
-            for ins in self.instructions:
-                if ins.i_in != -1:
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.randn(*((f_in, f_out) if f_in is not None else ()), ins.path_shape[0], self.r)))
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(*((f_in, f_out) if f_in is not None else ()), self.r, ins.path_shape[1])))
-            self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
-            self.LoRA_weight_numel = sum(ins.path_shape[0] * self.r + self.r * ins.path_shape[1] for ins in instructions if ins.i_in != -1)
         else:
             # For TorchScript, there always has to be some kind of defined .weight
             self.register_buffer('weight', torch.Tensor())
@@ -261,7 +251,7 @@ class Linear(CodeGenMixin, torch.nn.Module):
         self.register_buffer('output_mask', output_mask)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
+        return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights)"
 
     def forward(self, features, weight: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
         """evaluate
@@ -283,13 +273,6 @@ class Linear(CodeGenMixin, torch.nn.Module):
             if self.weight_numel > 0 and not self.internal_weights:
                 raise RuntimeError("Weights must be provided when internal_weights = False")
             weight = self.weight
-            LoRA_weight = []
-            for index, v in enumerate(self.LoRA_weight):
-                if index % 2 == 0:
-                    LoRA_weight.append(v)
-                else:
-                    LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-            weight = weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
         if bias is None:
             if self.bias_numel > 0 and not self.internal_weights:
                 raise RuntimeError("Biases must be provided when internal_weights = False")
@@ -358,18 +341,6 @@ class Linear(CodeGenMixin, torch.nn.Module):
             else:
                 yield this_weight
 
-    def merge_LoRA(self):
-        LoRA_weight = []
-        for index, v in enumerate(self.LoRA_weight):
-            if index % 2 == 0:
-                LoRA_weight.append(v)
-            else:
-                LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-        self.weight.data = self.weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
-        del self.LoRA_weight
-        del self.alpha
-        del self.r
-        del self.LoRA_weight_numel
 
 def _codegen_linear(
     irreps_in: o3.Irreps,

@@ -388,24 +388,13 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
 
         # === Determine weights ===
         self.weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.has_weight)
-        # LoRA weights initialization
-        self.LoRA_weight = []
-        self.alpha = 16
-        self.r = 16
-        self.LoRA_weight_numel = 0
-        
+
         if internal_weights and self.weight_numel > 0:
             assert self.shared_weights, "Having internal weights impose shared weights"
             self.weight = torch.nn.Parameter(torch.randn(self.weight_numel))
-            for ins in self.instructions:
-                if ins.has_weight:
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.randn(ins.path_shape[0] * ins.path_shape[1], self.r)))
-                    self.LoRA_weight.append(torch.nn.Parameter(torch.zeros(self.r, ins.path_shape[2])))
-            self.LoRA_weight_numel = sum(ins.path_shape[0] * ins.path_shape[1] * self.r + self.r * ins.path_shape[2] for ins in self.instructions if ins.has_weight)
         else:
             # For TorchScript, there always has to be some kind of defined .weight
             self.register_buffer('weight', torch.Tensor())
-        self.LoRA_weight = torch.nn.ParameterList(self.LoRA_weight)
 
         if self.irreps_out.dim > 0:
             output_mask = torch.cat([
@@ -429,7 +418,7 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         return (
             f"{self.__class__.__name__}"
             f"({self.irreps_in1.simplify()} x {self.irreps_in2.simplify()} "
-            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights | {self.LoRA_weight_numel} ELoRA_weights)"
+            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights)"
         )
 
     @torch.jit.unused
@@ -537,14 +526,6 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
 
         # - PROFILER - with torch.autograd.profiler.record_function(self._profiling_str):
         real_weight = self._get_weights(weight)
-        if self.LoRA_weight_numel > 0:
-            LoRA_weight = []
-            for index, v in enumerate(self.LoRA_weight):
-                if index % 2 == 0:
-                    LoRA_weight.append(v)
-                else:
-                    LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-            real_weight = real_weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
         return self._compiled_main_left_right(x, y, real_weight)
 
     def weight_view_for_instruction(
@@ -799,17 +780,3 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         ax.axis('off')
 
         return fig, ax
-    
-    def merge_LoRA(self):
-        if self.LoRA_weight_numel > 0:
-            LoRA_weight = []
-            for index, v in enumerate(self.LoRA_weight):
-                if index % 2 == 0:
-                    LoRA_weight.append(v)
-                else:
-                    LoRA_weight[-1] = (LoRA_weight[-1] @ v).flatten()
-            self.weight.data = self.weight + self.alpha / self.r * torch.cat(LoRA_weight, dim=-1)
-        del self.LoRA_weight
-        del self.alpha
-        del self.r
-        del self.LoRA_weight_numel
